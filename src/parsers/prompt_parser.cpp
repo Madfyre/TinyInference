@@ -1,5 +1,6 @@
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <cctype>
@@ -74,32 +75,6 @@ std::vector<std::string> Prompt2Words(const std::string& prompt) {
             result.push_back(prompt.substr(left, right - left));
         }
         left = right;
-    }
-
-    return result;
-}
-
-std::vector<std::u32string> Words2Unicode(const std::vector<std::string>& words) {
-    std::vector<std::u32string> result(words.size());
-    for (size_t i = 0; i < words.size(); ++i) {
-        result[i].resize(words[i].size());
-        for (size_t j = 0; j < words[i].size(); ++j) {
-            if ((static_cast<uint32_t>(words[i][j]) > 32 && static_cast<uint32_t>(words[i][j]) < 127) ||
-                (static_cast<uint32_t>(words[i][j]) > 160 && static_cast<uint32_t>(words[i][j]) < 173) ||
-                (static_cast<uint32_t>(words[i][j]) > 173 && static_cast<uint32_t>(words[i][j]) < 256)) {
-                result[i][j] = words[i][j];
-            } else {
-                result[i][j] = static_cast<uint32_t>(words[i][j]) + 256;
-            }
-        }
-    }
-
-    return result;
-}
-
-std::vector<size_t> Unicode2Token(const std::vector<std::u32string>& unicode) {
-    for (size_t i = 0; i < words.size(); ++i) {
-        
     }
 
     return result;
