@@ -1,6 +1,8 @@
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <list>
+#include <memory>
 #include <ostream>
 #include <queue>
 #include <stdexcept>
@@ -176,11 +178,113 @@ inline void RoPE(Matrix& result,const Matrix& cos_table,
             }
         }
     }
-    
-    // return result;
 }
 
+struct SubView {
+    size_t row;
+    size_t row_length;
+    size_t col;
+    size_t col_length;
+};
 
+inline void MatMulT(const SubView& left_view, const Matrix& left,
+                   const SubView& right_view, const Matrix& right,
+                   SubView& result_view, Matrix& result) {
+    for (size_t row = 0; row < left_view.row_length; ++row) {
+        for (size_t col = 0; col < right_view.row_length; col++) {
+            double acc = 0.0f;
+            for (size_t ind = 0; ind < right_view.col_length; ++ind) {
+                acc += left[left_view.row + row][left_view.col + ind] *
+                       right[right_view.row + col][right_view.col + ind];
+            }
+            result[result_view.row + row][result_view.col + col] = acc / std::sqrt(right_view.col_length);
+        }
+    }
+}
+
+inline void MatMul(const SubView& left_view, const Matrix& left,
+                   const SubView& right_view, const Matrix& right,
+                   SubView& result_view, Matrix& result) {
+    for (size_t row = 0; row < left_view.row_length; ++row) {
+        for (size_t col = 0; col < right_view.col_length; col++) {
+            double acc = 0.0f;
+            for (size_t ind = 0; ind < right_view.row_length; ++ind) {
+                acc += left[left_view.row + row][left_view.col + ind] *
+                       right[right_view.row + ind][right_view.col + col];
+            }
+            result[result_view.row + row][result_view.col + col] = acc;
+        }
+    }
+}
+
+inline Matrix AttentionScores(const Matrix& Q, const Matrix& K, int32_t heads_q, int32_t heads_k, int32_t head_dim)
+{
+    Matrix result{static_cast<size_t>(heads_q * Q.size()), std::vector<float>(Q.size())};
+    SubView q_view{0, Q.size(), 0, static_cast<size_t>(head_dim)};
+    SubView k_view{0, K.size(), 0, static_cast<size_t>(head_dim)};
+    SubView result_view{0, Q.size(), 0, Q.size()};
+    for (size_t head = 0; head < heads_q; ++head) {
+        int32_t head_k = head / (heads_q / heads_k);
+        q_view.col = head * head_dim;
+        k_view.col = head_k * head_dim;
+        result_view.row = head * Q.size();
+        MatMulT(q_view, Q, k_view, K, result_view, result);
+    }
+
+    return result;
+}
+
+inline Matrix CausalMaskAttn(Matrix& matrix)
+{
+    for (size_t row = 0; row < matrix.size(); ++row) {
+        size_t i = row % matrix[0].size(); 
+        for (size_t col = 0; col < matrix[0].size(); ++col) {
+            if (col > i) {
+                matrix[row][col] = -INFINITY;
+            }
+        }
+    }
+    return matrix;
+}
+
+inline Matrix SoftMax(Matrix& matrix)
+{
+    for (size_t row = 0; row < matrix.size(); ++row) {
+        float max_value = -INFINITY;
+        for (size_t col = 0; col < matrix[0].size(); ++col) {
+            max_value = std::max(max_value, matrix[row][col]);
+        }
+        float acc = 0.0;
+        for (size_t col = 0; col < matrix[0].size(); ++col) {
+            acc += std::exp(matrix[row][col] - max_value);
+        }
+        for (size_t col = 0; col < matrix[0].size(); ++col) {
+            matrix[row][col] = std::exp(matrix[row][col] - max_value) / acc;
+        }
+    }
+    return matrix;
+}
+
+inline Matrix Attention(const Matrix& Q, const Matrix& K, const Matrix& V,
+                        int32_t heads_q, int32_t heads_k, int32_t head_dim) {
+    auto attn_scores = AttentionScores(Q, K, heads_q, heads_k, head_dim);
+    auto masked = CausalMaskAttn(attn_scores);
+    auto softmaxed = SoftMax(masked);
+
+    Matrix result{static_cast<size_t>(Q.size()), std::vector<float>(Q[0].size())};
+    SubView softmax_view{0, Q.size(), 0, Q.size()};
+    SubView v_view{0, K.size(), 0, static_cast<size_t>(head_dim)};
+    SubView result_view{0, Q.size(), 0, static_cast<size_t>(head_dim)};
+
+    for (size_t head = 0; head < heads_q; ++head) {
+        softmax_view.row = head * Q.size();
+        v_view.col = head * head_dim;
+        result_view.col = head * head_dim;
+        MatMul(softmax_view, softmaxed, v_view, V, result_view, result);
+    }
+
+    return result;
+}
 
 int main() {
     std::string input = "Hello, I'm GPT-4 and I've got 1234 dollars. It'll be fine!!!\nYes, it's true.";
@@ -254,6 +358,9 @@ int main() {
 
     DebugMatrix(Q, "Q after RoPE: ");
     DebugMatrix(K, "K after RoPE: ");
+
+    Matrix attn_scores_matrix = Attention(Q, K, V, heads, K[0].size() / head_dim, head_dim);
+    DebugMatrix(attn_scores_matrix, "Attention: ");
 
     return 0;
 }
