@@ -239,5 +239,4 @@ std::unordered_map<uint64_t, MergeInfo> ImportMerges(const FileInfo& file_info,
     return result;
 }
 
-
 }

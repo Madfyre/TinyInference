@@ -1,3 +1,4 @@
+#include <cstddef>
 #include <cstdint>
 #include <list>
 #include <ostream>
@@ -12,15 +13,35 @@
 #include "../parsers/prompt_parser.cpp"
 #include "../parsers/model_parser.cpp"
 
+constexpr double PI = 3.14159265358979323846;
+
+
+using Matrix = std::vector<std::vector<float>>;
+
 void DebugWords(const std::vector<std::string>& words) {
     for (size_t i = 0; i < words.size(); ++i) {
         std::cout << "\"" << words[i] << "\"" << ", ";
     }
 }
 
+void DebugMatrix(const Matrix& matrix, const std::string& name, size_t rows_n = 3, size_t cols_n = 8) {
+    std::cout << name << ": [" << matrix.size() << ", " 
+              << (matrix.empty() ? 0 : matrix[0].size()) << "]\n";
+
+    size_t r = std::min(rows_n, matrix.size());
+    for (size_t i = 0; i < r; ++i) {
+        std::cout << "  row " << i << ": ";
+        size_t c = std::min(cols_n, matrix[i].size());
+        for (size_t j = 0; j < c; ++j) {
+            std::cout << matrix[i][j] << " ";
+        }
+        std::cout << (matrix[i].size() > cols_n ? "..." : "") << "\n";
+    }
+}
+
 std::vector<uint32_t> ParseWords(const std::string& word, 
-                                    const std::unordered_map<std::string, uint32_t>& vocab,
-                                    const std::unordered_map<uint64_t, parser::MergeInfo>& merges)
+                                 const std::unordered_map<std::string, uint32_t>& vocab,
+                                 const std::unordered_map<uint64_t, parser::MergeInfo>& merges)
 {
     if (auto it = vocab.find(word); it != vocab.end()) {
         return {it->second};
@@ -64,6 +85,103 @@ std::vector<uint32_t> ParseWords(const std::string& word,
     return parts;
 }
 
+inline Matrix Words2Embeddings(const std::unordered_map<std::string, uint32_t>& vocab,
+                        const std::vector<uint32_t>& ids,
+                        parser::Embeddings embed_matrix)
+{
+    Matrix result(ids.size(), std::vector<float>(embed_matrix.cols));
+    for (size_t i = 0; i < ids.size(); ++i) {
+        for (size_t j = 0; j < embed_matrix.cols; ++j) {
+            uint16_t* w = reinterpret_cast<uint16_t*>(embed_matrix.weights);
+            result[i][j] = parser::Bf16ToF32(w[ids[i] * embed_matrix.cols + j]);
+        }
+    }
+
+    return result;
+}
+
+inline void RMSNorm(Matrix& result, const parser::Tensor& input_layernorm, float eps = 1e-5) {
+    for (size_t row = 0; row < result.size(); ++row) {
+        double sum = 0.0;
+        for (size_t col = 0; col < result[0].size(); col++) {
+            sum += result[row][col] * result[row][col];
+        }
+        double rms = std::sqrt((sum / result[0].size()) + eps);
+        for (size_t col = 0; col < result[0].size(); col++) {
+            uint16_t* w = reinterpret_cast<uint16_t*>(input_layernorm.weights);
+            result[row][col] = (result[row][col] / rms * parser::Bf16ToF32(w[col]));
+        }
+    }
+}
+
+inline Matrix MatMul(const Matrix& left, const parser::Tensor& weight) {
+    Matrix result{left.size(), std::vector<float>(weight.rows, 0.0)};
+    uint16_t* weights = reinterpret_cast<uint16_t*>(weight.weights);
+
+    for (size_t row = 0; row < left.size(); ++row) {
+        for (size_t col = 0; col < weight.rows; col++) {
+            double acc = 0.0f;
+            for (size_t ind = 0; ind < left[0].size(); ++ind) {
+                acc += left[row][ind] * parser::Bf16ToF32(weights[col * weight.cols + ind]);
+            }
+            result[row][col] = acc;
+        }
+    }
+
+    return result;
+}
+
+inline std::pair<Matrix, Matrix> MakeRopeTables(int32_t head_dim, int32_t theta, int32_t seq_len, int32_t factor,
+                          int32_t lower_freq_factor, int32_t high_freq_factor, int32_t original_max)
+{
+    Matrix result_cos{static_cast<size_t>(seq_len), std::vector<float>(head_dim / 2)};
+    Matrix result_sin{static_cast<size_t>(seq_len), std::vector<float>(head_dim / 2)};
+
+    float low_freq_wavelen = static_cast<float>(original_max) / lower_freq_factor;
+    float high_freq_wavelen = static_cast<float>(original_max) / high_freq_factor;
+
+    for (size_t i = 0; i < head_dim / 2; ++i) {
+        float freq = 1.0f / (std::pow(theta, static_cast<float>(2 * i) / head_dim));
+        float wavelength = 2 * PI / freq;
+        if (wavelength > low_freq_wavelen) {
+            freq = freq / factor;
+        } else if (wavelength < high_freq_wavelen) {
+            freq = freq;
+        } else {
+            float smooth = (original_max / wavelength - lower_freq_factor) / (high_freq_factor - lower_freq_factor);
+            freq = freq * ((1 - smooth) / factor + smooth);
+        }
+        for (size_t j = 0; j < seq_len; ++j) {
+            result_sin[j][i] = std::sin(freq * j);
+            result_cos[j][i] = std::cos(freq * j);
+        }
+    }
+
+    return {result_sin, result_cos};
+}
+
+inline void RoPE(Matrix& result,const Matrix& cos_table,
+                   const Matrix& sin_table, int32_t n_heads, int32_t head_dim, int32_t seq_len)
+{
+    for (size_t pos = 0; pos < seq_len; ++pos) {
+        for (size_t head = 0; head < n_heads; ++head) {
+            size_t base = head * head_dim;
+            for (size_t head_index = 0; head_index < head_dim / 2; ++head_index) {
+                float r1 = result[pos][base + head_index];
+                float r2 = result[pos][base + head_index + head_dim / 2];
+                result[pos][base + head_index] = r1 * cos_table[pos][head_index] - r2 * sin_table[pos][head_index];
+                result[pos][base + head_index + head_dim / 2] = r1 * sin_table[pos][head_index] +
+                                                                r2 * cos_table[pos][head_index];
+
+            }
+        }
+    }
+    
+    // return result;
+}
+
+
+
 int main() {
     std::string input = "Hello, I'm GPT-4 and I've got 1234 dollars. It'll be fine!!!\nYes, it's true.";
 
@@ -77,13 +195,17 @@ int main() {
     std::vector<std::string> words = parser::Prompt2Words(input);
 
     std::cout << "TOKENS" << std::endl;
+    std::vector<uint32_t> tokens_idx;
+    tokens_idx.reserve(words.size());
     for (int i = 0; i < words.size(); ++i) {
         if (auto it = vocab.find(words[i]); it != vocab.end()) {
             std::cout << it->first << " " << it->second << std::endl;
+            tokens_idx.push_back(it->second);
         } else {
             std::vector<uint32_t> tokenized_word = ParseWords(words[i], vocab, merges);
             std::cout << words[i] << ": ";
             for (const auto& token : tokenized_word) {
+                tokens_idx.push_back(token);
                 std::cout << token << " ";
             }
             std::cout << std::endl;
@@ -92,6 +214,46 @@ int main() {
 
     DebugTensor(model.embed_tensor, "embed");
     DebugTensor(model.layers[0].q_proj, "layer0.q_proj");
-    
-    // DebugWords(words);
+    DebugTensor(model.layers[0].k_proj, "k_proj");
+
+    auto entrance_matrix = Words2Embeddings(vocab, tokens_idx, model.embed_tensor);
+    DebugMatrix(entrance_matrix, "embeddings: ");
+
+    RMSNorm(entrance_matrix, model.layers[0].input_layernorm);
+
+    DebugMatrix(entrance_matrix, "after RMSNorm: ");
+
+    auto Q = MatMul(entrance_matrix, model.layers[0].q_proj);
+    auto K = MatMul(entrance_matrix, model.layers[0].k_proj);
+    auto V = MatMul(entrance_matrix, model.layers[0].v_proj);
+    auto O = MatMul(entrance_matrix, model.layers[0].o_proj);
+
+    DebugMatrix(Q, "Q: ");
+    DebugMatrix(K, "K: ");
+    DebugMatrix(V, "V: ");
+    DebugMatrix(O, "O: ");
+
+    int32_t heads = 32;
+    int32_t head_dim = 64;
+    int32_t theta = 500000;
+    int32_t seq_len = 512;
+    int32_t factor = 4;
+    int32_t lower_freq_factor = 1;
+    int32_t high_freq_factor = 4;
+    int32_t original_max = 8192;
+
+    auto [sin_table, cos_table] = MakeRopeTables(head_dim, theta, seq_len, factor, lower_freq_factor, high_freq_factor, original_max);
+
+    DebugMatrix(sin_table, "sin_table: ");
+    DebugMatrix(cos_table, "cos_table: ");
+
+    std::cout << "QSIZE: " << Q.size() << std::endl;
+
+    RoPE(Q, cos_table, sin_table, heads, head_dim, Q.size());
+    RoPE(K, cos_table, sin_table, 8, head_dim, K.size());
+
+    DebugMatrix(Q, "Q after RoPE: ");
+    DebugMatrix(K, "K after RoPE: ");
+
+    return 0;
 }
