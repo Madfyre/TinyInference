@@ -149,26 +149,61 @@ size_t FindUnescapedQuote(const std::string_view& content, size_t init_pos) {
 }
 
 std::unordered_map<std::string, uint32_t> ImportTokens(const FileInfo& file_info) {
-    
+
     char* ptr = static_cast<char*>(mmap(nullptr, file_info.file_size, PROT_READ, MAP_PRIVATE, file_info.fd, 0));
     madvise(ptr, file_info.file_size, MADV_SEQUENTIAL);
 
-    std::string_view content{ptr, static_cast<size_t>(file_info.file_size)};
-
-    size_t vocab_pos = content.find("\"vocab\": {") + 10;
-    size_t vocab_end = content.find("\"merges\":", vocab_pos);
-
     std::unordered_map<std::string, uint32_t> result;
     result.reserve(file_info.file_size / 8);
+
+    std::string_view content{ptr, static_cast<size_t>(file_info.file_size)};
+
+    // ADDED TOKENS
+
+    size_t added_tokens_pos = content.find("[", content.find("\"added_tokens\"") + 1);
+    size_t added_tokens_end = content.find("\"pre_tokenizer\": {", added_tokens_pos);
+    size_t arr_end = content.find("]", added_tokens_pos);
+
+    while (added_tokens_pos < added_tokens_end) {
+        size_t start_token_info = content.find("{", added_tokens_pos) + 1;
+        size_t end_token_info = content.find("}", start_token_info);
+
+        if (start_token_info > arr_end) {
+            break;
+        }
+
+        size_t start_id = content.find("\"id\":", start_token_info) + 6; 
+        size_t end_id = content.find("\"content\":", start_token_info) - 2;
+
+        uint32_t id = 0;
+        std::from_chars(content.data() + start_id, content.data() + end_id, id);
+
+        size_t start_content_token = end_id + 14; 
+        size_t end_content_token = content.find("\"", start_content_token); 
+
+        std::string token = {ptr + start_content_token, end_content_token - start_content_token};
+
+        result[token] = id;
+        added_tokens_pos = end_content_token + 1;
+    }
+
+    // VOCAB
+
+    size_t vocab_pos = content.find("\"vocab\": {", added_tokens_end) + 10;
+    size_t vocab_end = content.find("\"merges\": [", vocab_pos);
 
     while (vocab_end > vocab_pos) {
         size_t token_start = FindUnescapedQuote(content, vocab_pos) + 1;
         size_t token_end = FindUnescapedQuote(content, token_start);
 
+        if (token_start > vocab_end) {
+            break;
+        }
+
         size_t number_start = token_end + 3;
         size_t number_end = content.find(",", number_start);
 
-        uint32_t id;
+        uint32_t id = 0;
         std::from_chars(content.data() + number_start, content.data() + number_end, id);
 
         std::string key = Utf8ToString({ptr + token_start, token_end - token_start});
@@ -176,7 +211,6 @@ std::unordered_map<std::string, uint32_t> ImportTokens(const FileInfo& file_info
 
         vocab_pos = number_end;
     }
-
     munmap(ptr, static_cast<size_t>(file_info.file_size));
 
     return result;

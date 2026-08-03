@@ -136,6 +136,11 @@ Model ParseConfig(const FileInfo& file_info) {
             continue;
         }
 
+        if (str.find("model.norm.weight") != std::string::npos) {
+            model.final_norm = TensorParser(str, ptr, metadata_length);
+            continue;
+        }
+
         if (auto it = str.find("model.layers"); it != std::string::npos) {
             size_t layer_number =  std::stoll(str.substr(it + 13, str.find('.', it + 13) - (it + 13)));
             if (model.layers.size() <= layer_number) {

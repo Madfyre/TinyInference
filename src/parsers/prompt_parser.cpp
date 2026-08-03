@@ -12,10 +12,13 @@ namespace parser {
 
 std::string punctuation = {'!', '.', ',',
                            '?', '/', '\\',
-                           '*', '-', '#'
+                           '*', '-', '#', 
+                           '\n', '\r', '\t',
+                           ':', ';', '=',
+                           '%', 
                           };
 
-std::string spaces = {'\n', '\r', '\t'};
+// std::string spaces = {'\n', '\r', '\t'};
 
 std::vector<std::string> Prompt2Words(const std::string& prompt) {
     size_t left = 0;
@@ -50,14 +53,6 @@ std::vector<std::string> Prompt2Words(const std::string& prompt) {
                     result.push_back(prompt.substr(left, 3));
                     left += 3;
                 }
-                right++;
-            }
-        } else if (spaces.find(prompt[right]) != std::string::npos) {
-            if (prompt[left] == ' ') {
-                result.push_back(" ");
-                left++;
-            }
-            while (spaces.find(prompt[right]) != std::string::npos) {
                 right++;
             }
         } else if (punctuation.find(prompt[right]) != std::string::npos) {
