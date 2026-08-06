@@ -1,15 +1,44 @@
-# TinyInference
+<div align="center">
+  <h1>TinyInference</h1>
+</div>
 
-A Llama 3.2 inference engine written from scratch in C++23. Just libc++, POSIX `mmap`, and
-about 1200 lines of code.
+<div align="center">
+  <b>Llama 3.2 inference written from scratch in C++23</b>
+</div>
 
-It loads stock HuggingFace checkpoints (`config.json`, `model.safetensors`,
-`tokenizer.json`) and runs a full forward pass on the CPU.
+<div align="center">
+  no dependencies · CPU · ~2000 lines · CUDA port in progress
+</div>
+
+<br/>
+
+Loads stock HuggingFace checkpoints (`config.json`, `model.safetensors`, `tokenizer.json`)
+and runs a full forward pass on the CPU. No BLAS, no JSON library, no tokenizer library —
+just libc++ and POSIX `mmap`.
 
 ```
 $ ./build/infer
 2 + 2 = 4
 ```
+
+## Project Updates
+
+- 🔥 ```2026/08/06```: CUDA kernels migrated from [Madfyre/CUDA](https://github.com/Madfyre/CUDA) into `src/cuda` — staging ground for the GPU port, not wired into the build yet.
+- 🔥 ```2026/08/06```: Big refactoring — `Llama` + `LlamaBuilder`, `Tokenizer`, RAII `MappedFile`, a shared `JsonLexer`, and three streaming parsers replacing the hand-rolled string scanning.
+- 🔥 ```2026/08/03```: CPU inference works end to end.
+- 🔥 ```2026/07/28```: Full attention — GQA, causal mask, softmax, AV — verified layer by layer against a PyTorch reference.
+- 🔥 ```2026/07/28```: RMSNorm, MatMul and RoPE on CPU.
+- 🔥 ```2026/07/27```: Parsers done.
+
+## Table of Contents
+
+1. [Quick start](#quick-start)
+2. [What it can do](#what-it-can-do)
+3. [Layout](#layout)
+4. [Execution flow](#execution-flow)
+5. [CUDA](#cuda)
+6. [Todo List](#-todo-list)
+
 ## Quick start
 
 Put a HuggingFace checkpoint in `models/`:
@@ -29,6 +58,13 @@ cmake -B build -G Ninja && cmake --build build && ./build/infer
 
 The prompt, model directory and reference directory are currently hardcoded in
 [`src/app/main.cpp`](src/app/main.cpp).
+
+### Model Zoo
+
+| Model | Params | Precision | Status |
+|---|---|---|---|
+| Llama-3.2-1B-Instruct | 1.24 B | BF16 | ✅ verified against PyTorch, all 17 hidden states |
+| Llama-3.2-1B | 1.24 B | BF16 | ✅ loads and runs |
 
 ## What it can do
 
@@ -65,11 +101,12 @@ src/
 │   ├── model_parser.cpp      safetensors header   → Model (tensor views)
 │   ├── tokenizer_parser.cpp  tokenizer.json       → vocab + merges
 │   └── prompt_parser.cpp     text                 → pre-tokenized words
+├── cuda/                     GPU port — see src/cuda/README.md
 └── engine/
     └── engine.cpp            unused stub, does not compile
 ```
 
-The project is a **unity build**: everything is `#include`d into `main.cpp` as
+The CPU engine is a **unity build**: everything is `#include`d into `main.cpp` as
 a single translation unit, so `CMakeLists.txt` has exactly one source file.
 
 ## Execution flow
@@ -204,50 +241,77 @@ turn the per-token cost from *O(seq²)* into *O(seq)*.
 `n_layers` = final norm), which is how `main.cpp` drives the reference
 comparison without the model knowing anything about testing.
 
-## Task board
+## CUDA
 
-### Parsers
+`src/cuda` holds kernels brought over from [Madfyre/CUDA](https://github.com/Madfyre/CUDA)
+as the starting material for a GPU decode path. They are **not part of the CMake
+build yet** — each bench driver compiles standalone with `nvcc`.
 
-| | Task | Notes |
-|---|---|---|
-| ✅ | `MappedFile` RAII wrapper | Move-only, closes fd right after `mmap`, checks `MAP_FAILED`. |
-| ✅ | `JsonLexer` | Pull-style, `Peek`/`Next`/`NextMember`/`NextElement`, full `SkipValue` with depth tracking. |
-| ✅ | `config.json` parser | Required-field bitmask, GQA divisibility check, scalar-or-array `eos_token_id`. |
-| ✅ | safetensors header parser | Named lookup, arbitrary shape rank, `__metadata__` skipped, header length bounds-checked. |
-| ✅ | `tokenizer.json` parser | Single pass, single `mmap`, fused decode, surrogate pairs, all JSON escapes. |
-| ✅ | Byte-level vs literal decode split | `DecodeByteLevel` for vocab/merges, `DecodeUtf8` for added tokens. |
-| ❌ | `tokenizer_config.json` parser | `chat_template`, `bos_token`, `eos_token`. Chat format is hardcoded in `ChatPrompt` today. |
-| ❌ | Per-tensor bounds check | Header length is validated, but `data_offsets` are not checked against file size. |
-| ❌ | `dtype` validation | Field is parsed, never verified. Anything non-BF16 is silently reinterpreted. |
-| ❌ | Right-sized `reserve` | Still `content.size() / 8` — 2.1 M buckets for 128 k entries. Should use `vocab_size` from config. |
-| 🚧 | Pre-tokenizer | Hand-rolled approximation. The real llama3 regex sits unused in `tokenizer.json`. Deferred: needs Unicode tables. |
+The shape of the problem, in one paragraph: decode reads every weight in the model
+for every single token — 1.95 GB of layer weights plus a 525 MB tied LM head — at
+roughly 1 flop per byte. It is bound by memory bandwidth and nothing else, so GEMV
+and INT8 quantization matter and tiling does not. Prefill is the mirror image:
+same weights read once for all S tokens, FLOPs growing with S, compute-bound,
+wants tensor cores. **The two need different kernel families.**
 
-### Model
+Full analysis, per-kernel plan and build instructions: [`src/cuda/README.md`](src/cuda/README.md)
+and [`src/cuda/bench/README.md`](src/cuda/bench/README.md).
 
-| | Task | Notes |
-|---|---|---|
-| ✅ | `Matrix` | Row-major, `operator[](row, col)` via C++23 multidimensional subscript. |
-| ✅ | RMSNorm, MatMul, Add, Hadamard, SiLU, SoftMax | Verified layer by layer. |
-| ✅ | RoPE with llama3 scaling | Low/high frequency wavelength interpolation. |
-| ✅ | Grouped-query attention | 32 Q heads over 8 KV heads, causal mask, scaled scores. |
-| ✅ | Tied LM head | Reuses `embed_tokens` — no separate output matrix. |
-| ✅ | `Llama` + `LlamaBuilder` | Config/weights/tokenizer owned in one place, cross-validated. |
-| ✅ | `Tokenizer` + `ChatPrompt` | Encode, id↔token, fluent chat construction. |
-| ❌ | **KV cache** | The single biggest win available. Requires reworking `CausalMaskAttn`, which currently assumes `seq_q == seq_k`. |
-| ❌ | Sampling | Greedy only — no temperature, top-k, top-p, or repetition penalty. |
-| ❌ | Multi-threading | Everything single-threaded. |
-| ❌ | SIMD | `MatMul` is scalar with 4-way unrolling. No NEON/AVX. |
-| ❌ | Quantization | BF16 only. |
-| ❌ | Prefill/decode split | No batched prompt processing. |
+## 📑 Todo List
 
-### Infrastructure
+- [ ] Parsers
+  - [x] `MappedFile` — RAII `mmap`, move-only, `MAP_FAILED` checked
+  - [x] `JsonLexer` — pull-style, full `SkipValue` with depth tracking
+  - [x] `config.json` → `ModelConfig`, required-field mask, GQA divisibility check
+  - [x] `model.safetensors` header → named tensor views
+  - [x] `tokenizer.json` → vocab + merges
+      - [x] single pass, single `mmap`
+      - [x] byte-level vs literal decode split
+      - [x] surrogate pairs and all JSON escapes
+      - [ ] size `reserve` from `vocab_size` instead of file size
+  - [ ] `tokenizer_config.json` — chat template, bos/eos
+  - [ ] `data_offsets` bounds check per tensor
+  - [ ] `dtype` validation — parsed today, never verified
+  - [ ] pre-tokenizer driven by the llama3 regex instead of the hand-rolled split
+- [ ] CPU inference
+  - [x] `Matrix` — row-major, C++23 multidimensional subscript
+  - [x] RMSNorm, MatMul, Add, Hadamard, SiLU, SoftMax
+  - [x] RoPE with llama3 frequency scaling
+  - [x] Grouped-query attention — 32 Q heads over 8 KV heads, causal mask
+  - [x] Tied LM head
+  - [x] `Llama` + `LlamaBuilder`
+  - [x] `Tokenizer` + `ChatPrompt`
+  - [x] Greedy decoding
+  - [ ] **KV cache** — also needs `CausalMaskAttn` reworked, it assumes `seq_q == seq_k`
+  - [ ] Sampling — temperature, top-k, top-p, repetition penalty
+  - [ ] Multi-threading
+  - [ ] SIMD — `MatMul` is scalar with 4-way unrolling
+  - [ ] Quantization
+- [ ] CUDA
+  - [x] Kernels migrated
+      - [x] GEMM — tiled, register-blocked, plus a CUTLASS variant with fused epilogue
+      - [x] INT8 quantization
+      - [x] Block/warp reductions, Top-K, prefix sum
+      - [x] Test and benchmark drivers
+  - [ ] Per-operation reference dumps — `CompareRef` is layer granularity, a layer is seven ops
+  - [ ] Embedding gather, RMSNorm, argmax
+  - [ ] **GEMV for decode** — ~80% of inference time
+  - [ ] RoPE, KV-cache append
+  - [ ] Naive attention — QK^T, mask, online softmax, AV
+  - [ ] SwiGLU → full working GPU decode at this point
+  - [ ] Fused flash-decode attention
+  - [ ] Fusions — residual+norm, QKV, gate+up, LM head+argmax
+  - [ ] Prefill GEMM path
+  - [ ] CUDA graphs
+- [ ] Infrastructure
+  - [x] CMake build — Ninja, C++23, `compile_commands.json`
+  - [x] Reference comparison harness — `h0..h16` dumps from PyTorch
+  - [ ] CLI — prompt, model dir and ref dir are hardcoded
+  - [ ] Unit tests
+  - [ ] `.h` / `.cpp` split — blocks separate compilation and unit tests
+  - [ ] Wire `src/cuda` into the build
+  - [ ] Remove or finish the `engine/engine.cpp` stub
 
-| | Task | Notes |
-|---|---|---|
-| ✅ | CMake build | Ninja, C++23, `compile_commands.json` exported. |
-| ✅ | Reference comparison harness | `CompareRef` + `.bin` dumps from PyTorch. |
-| ❌ | Tests | No unit tests. Verification is the reference dump plus eyeballing output. |
-| ❌ | CLI | Prompt, model dir and ref dir are hardcoded in `main.cpp`. |
-| ❌ | Real header split | `.cpp` files `#include` each other with `#pragma once`. Works for one target; blocks separate compilation and unit tests. |
-| ❌ | Delete or finish `engine/engine.cpp` | Dead stub, missing a semicolon and an include — it would not compile if anything included it. |
-| 🚧 | Include hygiene | `model_parser.cpp` includes `tokenizer_parser.cpp` only to reach `JsonLexer` transitively; should include `json_lexer.cpp` directly. |
+# Author
+
+[Madfyre](https://github.com/Madfyre)
