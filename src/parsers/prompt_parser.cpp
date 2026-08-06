@@ -17,9 +17,7 @@ std::string punctuation = {'!', '.', ',',
                            ':', ';', '=',
                            '%', 
                           };
-
-// std::string spaces = {'\n', '\r', '\t'};
-
+                          
 std::vector<std::string> Prompt2Words(const std::string& prompt) {
     size_t left = 0;
     size_t right = 0;

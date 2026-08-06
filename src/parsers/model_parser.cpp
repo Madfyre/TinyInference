@@ -8,12 +8,8 @@
 #include <iostream>
 #include <charconv>
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
-#include "../parsers/tokenizer_parser.cpp"
+#include "mapped_file.cpp"
+#include "tokenizer_parser.cpp"
 
 namespace parser {
 
@@ -26,7 +22,7 @@ struct Tensor {
     size_t offset;
     size_t tensor_size;
 
-    unsigned char* weights;
+    const unsigned char* weights;
 };
 
 struct Layer {
@@ -49,6 +45,7 @@ struct Model {
     Embeddings embed_tensor;
     std::vector<Layer> layers;
     Tensor final_norm;
+    MappedFile mapping;
 };
 
 float Bf16ToF32(uint16_t bf16) {
@@ -76,97 +73,136 @@ void DebugTensor(const Tensor& tensor, const std::string& name, size_t n = 8) {
     std::cout << "\n";
 }
 
-Tensor TensorParser(std::string_view str, char* mmap_base, uint64_t metadata_length) {
+// {"dtype":"BF16","shape":[128256,2048],"data_offsets":[0,525336576]}
+Tensor TensorParser(JsonLexer& lexer, const char* mmap_base, uint64_t metadata_length) {
     Tensor tensor;
+    size_t end_offset = 0;
 
-    size_t dtype_start = str.find("dtype");  
-    size_t shape_start = str.find("shape", dtype_start);
-    size_t data_offsets_start = str.find("data_offsets", shape_start);
+    bool has_dtype = false;
+    bool has_shape = false;
+    bool has_offsets = false;
 
-    tensor.dtype = str.substr(dtype_start + 8, ((shape_start - 3) - (dtype_start + 8)));
+    lexer.Expect(JsonKind::kObjectBegin);
+    while (lexer.NextMember()) {
+        if (lexer.key() == "dtype") {
+            lexer.Expect(JsonKind::kString);
+            tensor.dtype = std::string(lexer.text());
+            has_dtype = true;
+        } else if (lexer.key() == "shape") {
+            size_t dims[2] = {1, 1};
+            size_t rank = 0;
 
-    auto shape_str = str.substr(shape_start + 8, ((data_offsets_start - 3) - (shape_start + 8)));
-    size_t comma = shape_str.find(',');
-    std::from_chars(shape_str.data(), shape_str.data() + comma, tensor.rows);
+            lexer.Expect(JsonKind::kArrayBegin);
+            while (lexer.NextElement()) {
+                lexer.Expect(JsonKind::kNumber);
+                if (rank < 2) {
+                    dims[rank] = lexer.Number<size_t>();
+                }
+                ++rank;
+            }
+            if (rank == 0 || rank > 2) {
+                throw std::runtime_error("safetensors: unsupported tensor rank " + std::to_string(rank));
+            }
 
-    if (shape_str.find(',') == std::string::npos) {
-        tensor.cols = 1;
-    } else {
-        std::from_chars(shape_str.data() + comma + 1, shape_str.data() + shape_str.size(), tensor.cols);
+            tensor.rows = dims[0];
+            tensor.cols = (rank == 2) ? dims[1] : 1;
+            has_shape = true;
+        } else if (lexer.key() == "data_offsets") {
+            lexer.Expect(JsonKind::kArrayBegin);
+            lexer.Expect(JsonKind::kNumber);
+            tensor.offset = lexer.Number<size_t>();
+            lexer.Expect(JsonKind::kComma);
+            lexer.Expect(JsonKind::kNumber);
+            end_offset = lexer.Number<size_t>();
+            lexer.Expect(JsonKind::kArrayEnd);
+            has_offsets = true;
+        } else {
+            lexer.SkipValue();
+        }
     }
-    std::from_chars(str.data() + data_offsets_start + 15, str.data() + str.find(',', data_offsets_start + 15), tensor.offset);
 
-    size_t end_offset;
-    std::from_chars(str.data() + str.find(',', data_offsets_start + 15) + 1, str.data() + str.size(), end_offset);
+    if (!has_dtype || !has_shape || !has_offsets) {
+        throw std::runtime_error("safetensors: tensor entry is missing dtype, shape or data_offsets");
+    }
 
     tensor.tensor_size = end_offset - tensor.offset;
-    tensor.weights = reinterpret_cast<unsigned char*>(mmap_base) + 8 + metadata_length + tensor.offset;
+    tensor.weights = reinterpret_cast<const unsigned char*>(mmap_base) + 8 + metadata_length + tensor.offset;
 
     return tensor;
 }
 
-Model ParseConfig(const FileInfo& file_info) {
-    char* ptr = static_cast<char*>(mmap(nullptr, file_info.file_size, PROT_READ, MAP_PRIVATE, file_info.fd, 0));
+Tensor* LayerSlot(Layer& layer, std::string_view field) {
+    if (field == "self_attn.q_proj.weight") return &layer.q_proj;
+    if (field == "self_attn.k_proj.weight") return &layer.k_proj;
+    if (field == "self_attn.v_proj.weight") return &layer.v_proj;
+    if (field == "self_attn.o_proj.weight") return &layer.o_proj;
+    if (field == "mlp.gate_proj.weight") return &layer.gate_proj;
+    if (field == "mlp.up_proj.weight") return &layer.up_proj;
+    if (field == "mlp.down_proj.weight") return &layer.down_proj;
+    if (field == "input_layernorm.weight") return &layer.input_layernorm;
+    if (field == "post_attention_layernorm.weight") return &layer.post_attn_layernorm;
+    return nullptr;
+}
 
+Model ParseWeights(MappedFile file) {
+    if (file.size() < 8) {
+        throw std::runtime_error("safetensors: file is too small to hold a header length");
+    }
+
+    const char* ptr = file.data();
     uint64_t metadata_length;
     std::memcpy(&metadata_length, ptr, 8);
-
-    std::string_view config{ptr + 8, metadata_length};
-    std::vector<std::string> types;
-
-    size_t left = 1;
-    size_t right = 1;
-    while (left != std::string::npos) {
-        right = config.find(',', config.find('}', left));
-
-        if (right == std::string::npos) {
-            types.emplace_back(config.data() + left, config.data() + metadata_length - 1);
-            break;
-        }
-
-        types.emplace_back(config.data() + left, config.data() + right);
-        left = right + 1;
+    if (metadata_length > file.size() - 8) {
+        throw std::runtime_error("safetensors: header length " + std::to_string(metadata_length) +
+                                 " exceeds the file");
     }
 
     Model model;
     model.layers.resize(1);
-    for (const auto& str : types) {
-        if (auto it = str.find("model.embed_tokens.weight"); it != std::string::npos) {
-            model.embed_tensor = TensorParser(str, ptr, metadata_length);
+
+    constexpr std::string_view kLayerPrefix = "model.layers.";
+
+    JsonLexer lexer{std::string_view{ptr + 8, metadata_length}};
+    lexer.Expect(JsonKind::kObjectBegin);
+    while (lexer.NextMember()) {
+        std::string_view name = lexer.key();
+
+        if (name == "model.embed_tokens.weight") {
+            model.embed_tensor = TensorParser(lexer, ptr, metadata_length);
+            continue;
+        }
+        if (name == "model.norm.weight") {
+            model.final_norm = TensorParser(lexer, ptr, metadata_length);
+            continue;
+        }
+        if (!name.starts_with(kLayerPrefix)) {
+            lexer.SkipValue();  // __metadata__ and anything else we ignore
             continue;
         }
 
-        if (str.find("model.norm.weight") != std::string::npos) {
-            model.final_norm = TensorParser(str, ptr, metadata_length);
-            continue;
+        std::string_view rest = name.substr(kLayerPrefix.size());
+        size_t dot = rest.find('.');
+        if (dot == std::string_view::npos) {
+            throw std::runtime_error("safetensors: malformed layer name '" + std::string(name) + "'");
         }
 
-        if (auto it = str.find("model.layers"); it != std::string::npos) {
-            size_t layer_number =  std::stoll(str.substr(it + 13, str.find('.', it + 13) - (it + 13)));
-            if (model.layers.size() <= layer_number) {
-                model.layers.resize(layer_number + 1);
-            }
-            if (str.find("q_proj") != std::string::npos) {
-                model.layers[layer_number].q_proj = TensorParser(str, ptr, metadata_length);
-            } else if (str.find("k_proj") != std::string::npos) {
-                model.layers[layer_number].k_proj = TensorParser(str, ptr, metadata_length);
-            } else if (str.find("v_proj") != std::string::npos) {
-                model.layers[layer_number].v_proj = TensorParser(str, ptr, metadata_length);
-            } else if (str.find("o_proj") != std::string::npos) {
-                model.layers[layer_number].o_proj = TensorParser(str, ptr, metadata_length);
-            } else if (str.find("gate_proj") != std::string::npos) {
-                model.layers[layer_number].gate_proj = TensorParser(str, ptr, metadata_length);
-            } else if (str.find("up_proj") != std::string::npos) {
-                model.layers[layer_number].up_proj = TensorParser(str, ptr, metadata_length);
-            } else if (str.find("down_proj") != std::string::npos) {
-                model.layers[layer_number].down_proj = TensorParser(str, ptr, metadata_length);
-            } else if (str.find("input_layernorm") != std::string::npos) {
-                model.layers[layer_number].input_layernorm = TensorParser(str, ptr, metadata_length);
-            } else if (str.find("post_attention_layernorm") != std::string::npos) {
-                model.layers[layer_number].post_attn_layernorm = TensorParser(str, ptr, metadata_length);
-            }
+        size_t layer_number = 0;
+        auto [end, ec] = std::from_chars(rest.data(), rest.data() + dot, layer_number);
+        if (ec != std::errc{}) {
+            throw std::runtime_error("safetensors: malformed layer index in '" + std::string(name) + "'");
+        }
+        if (model.layers.size() <= layer_number) {
+            model.layers.resize(layer_number + 1);
+        }
+
+        if (Tensor* slot = LayerSlot(model.layers[layer_number], rest.substr(dot + 1)); slot != nullptr) {
+            *slot = TensorParser(lexer, ptr, metadata_length);
+        } else {
+            lexer.SkipValue();
         }
     }
+
+    model.mapping = std::move(file);
     return model;
 }
 
