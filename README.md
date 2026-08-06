@@ -1,7 +1,6 @@
 # TinyInference
 
-A Llama 3.2 inference engine written from scratch in C++23. No dependencies —
-no BLAS, no JSON library, no tokenizer library. Just libc++, POSIX `mmap`, and
+A Llama 3.2 inference engine written from scratch in C++23. Just libc++, POSIX `mmap`, and
 about 1200 lines of code.
 
 It loads stock HuggingFace checkpoints (`config.json`, `model.safetensors`,
@@ -11,24 +10,6 @@ It loads stock HuggingFace checkpoints (`config.json`, `model.safetensors`,
 $ ./build/infer
 2 + 2 = 4
 ```
-
-## Status
-
-Working end to end on **Llama-3.2-1B-Instruct** (BF16, 2.47 GB).
-
-Every hidden state is verified against a PyTorch reference dump — all 17
-tensors (embeddings, 16 decoder layers, final norm) match:
-
-```
-ref_instruct/h0.bin   max_abs=0.000e+00  max_rel=0.000e+00  OK
-ref_instruct/h1.bin   max_abs=4.959e-05  max_rel=1.059e-01  OK
-...
-ref_instruct/h16.bin  max_abs=2.213e-04  max_rel=3.496e-01  OK
-```
-
-Generation is correct but slow: there is **no KV cache**, so every new token
-re-runs the whole sequence through all 16 layers. The run above took ~70 s.
-
 ## Quick start
 
 Put a HuggingFace checkpoint in `models/`:
@@ -270,26 +251,3 @@ comparison without the model knowing anything about testing.
 | ❌ | Real header split | `.cpp` files `#include` each other with `#pragma once`. Works for one target; blocks separate compilation and unit tests. |
 | ❌ | Delete or finish `engine/engine.cpp` | Dead stub, missing a semicolon and an include — it would not compile if anything included it. |
 | 🚧 | Include hygiene | `model_parser.cpp` includes `tokenizer_parser.cpp` only to reach `JsonLexer` transitively; should include `json_lexer.cpp` directly. |
-
-## Suggested next steps
-
-1. **KV cache.** Biggest speedup by far, and it forces the attention code to
-   stop assuming square score matrices — which is the right design anyway.
-2. **`tokenizer_config.json`.** Removes the last hardcoded model-specific
-   knowledge from the code. Note that *executing* a Jinja `chat_template` is a
-   much larger job than parsing it; extracting the string is step one.
-3. **Split `.h` / `.cpp` and add tests.** Once the parsers compile
-   independently, they can be tested independently.
-4. **Bounds-check `data_offsets`.** A malformed checkpoint currently produces
-   out-of-range pointers into the mapping. llama.cpp has shipped CVEs in
-   exactly this spot.
-
-## Verification method
-
-Reference tensors in `ref/` and `ref_instruct/` are hidden states dumped from
-PyTorch for the same prompt, as raw `float32`. `CompareRef` reports max absolute
-and max relative error per tensor and flags anything above `1e-2`.
-
-Relative error looks alarming in places (up to `0.66`), but that is measured at
-near-zero elements where the denominator collapses. Absolute error stays at
-`1.6e-3` on values around `410`, which is BF16 rounding noise, not a bug.
